@@ -23,7 +23,7 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# 16:9 widescreen estándar optimizado
+# 16:9 widescreen estándar optimizado (liviano, estable y continuo)
 ANCHO_OUT = 640
 ALTO_OUT = 360
 FPS = 30
@@ -71,21 +71,19 @@ def calcular_coeficientes_perspectiva(pa, pb):
     res = np.dot(np.linalg.inv(A.T * A) * A.T, B)
     return np.array(res).reshape(8)
 
-def crear_clip_biombo_3d(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40, apertura_muros=0.20):
+def crear_clip_biombo_fino(img_base, duracion=2.4, modo="crucero", sesgo_y=0.40, zoom_ratio=0.35, apertura_extremos=0.25):
     """
-    Proyección 2.5D en biombo continuo de 3 paños:
-    - Muro Izq (0 a 25% del ancho)
-    - Fondo Centro (25% a 75% del ancho)
-    - Muro Der (75% a 100% del ancho)
-    Las aristas compartidas se mantienen soldadas en todo momento.
+    Biombo calibrado con marco central amplio (84% centro, 8% laterales):
+    - Centro completo sin cortes que rompan logos o la estructura principal.
+    - Muros laterales delgados que se abren a los lados para dar volumen.
     """
     w_orig, h_orig = img_base.size
 
-    # Puntos de corte de las franjas sobre la imagen original
-    x_c1 = w_orig * 0.25
-    x_c2 = w_orig * 0.75
+    # Partición: 8% Izquierda - 84% Centro - 8% Derecha
+    FRAC_LATERAL = 0.08
+    x_c1 = w_orig * FRAC_LATERAL
+    x_c2 = w_orig * (1.0 - FRAC_LATERAL)
 
-    # Cortes originales de los 3 paños
     img_izq = img_base.crop((0, 0, int(x_c1), h_orig))
     img_cen = img_base.crop((int(x_c1), 0, int(x_c2), h_orig))
     img_der = img_base.crop((int(x_c2), 0, w_orig, h_orig))
@@ -94,9 +92,9 @@ def crear_clip_biombo_3d(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40, a
     w_cen = int(x_c2 - x_c1)
     w_der = int(w_orig - x_c2)
 
-    # Anchos destino base en el canvas final
-    out_x1 = int(ANCHO_OUT * 0.25)
-    out_x2 = int(ANCHO_OUT * 0.75)
+    # Anchos destino base en pantalla
+    out_x1 = int(ANCHO_OUT * FRAC_LATERAL)
+    out_x2 = int(ANCHO_OUT * (1.0 - FRAC_LATERAL))
     out_w_izq = out_x1
     out_w_cen = out_x2 - out_x1
     out_w_der = ANCHO_OUT - out_x2
@@ -104,7 +102,7 @@ def crear_clip_biombo_3d(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40, a
     def make_frame(t):
         p = max(0.0, min(1.0, t / duracion))
 
-        # Curva de inercia
+        # Curva cinemática
         if modo == "acelerar":
             f = p * p
         elif modo == "crucero":
@@ -114,8 +112,8 @@ def crear_clip_biombo_3d(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40, a
         else:
             f = p * p * (3.0 - 2.0 * p)
 
-        # 1. Movimiento del Fondo Central: Push-In moderado
-        zoom_cen = 1.0 - (f * 0.12)
+        # 1. Movimiento frontal decidido hacia el fondo
+        zoom_cen = 1.0 - (f * zoom_ratio)
         cw = w_cen * zoom_cen
         ch = h_orig * zoom_cen
         cx_c = w_cen / 2.0
@@ -134,14 +132,11 @@ def crear_clip_biombo_3d(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40, a
             Image.Resampling.BILINEAR
         )
 
-        # 2. Deformación de Muros Laterales (Homografía continua)
-        # Fuga vertical hacia los extremos exteriores
-        delta_v = (f * apertura_muros) * (ALTO_OUT * 0.35)
-        # Empuje horizontal hacia afuera
-        delta_h = (f * apertura_muros) * (out_w_izq * 0.30)
+        # 2. Deformación de las franjas laterales delgadas
+        delta_v = (f * apertura_extremos) * (ALTO_OUT * 0.30)
+        delta_h = (f * apertura_extremos) * (out_w_izq * 0.40)
 
-        # Puntos destino para el paño izquierdo:
-        # Borde exterior izquierdo se expande hacia arriba, abajo y hacia afuera
+        # Muro Izquierdo: arista interior soldada al centro, arista exterior se abre
         pts_dst_izq = [(0, 0), (out_w_izq, 0), (out_w_izq, ALTO_OUT), (0, ALTO_OUT)]
         pts_src_izq = [
             (delta_h, delta_v),
@@ -157,8 +152,7 @@ def crear_clip_biombo_3d(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40, a
             Image.Resampling.BILINEAR
         )
 
-        # Puntos destino para el paño derecho:
-        # Borde exterior derecho se expande simétricamente
+        # Muro Derecho: arista interior soldada al centro, arista exterior se abre
         pts_dst_der = [(0, 0), (out_w_der, 0), (out_w_der, ALTO_OUT), (0, ALTO_OUT)]
         pts_src_der = [
             (0, 0),
@@ -174,7 +168,7 @@ def crear_clip_biombo_3d(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40, a
             Image.Resampling.BILINEAR
         )
 
-        # 3. Pegado de los tres paños contiguos en el frame final
+        # 3. Pegado sin costuras
         canvas = Image.new("RGB", (ANCHO_OUT, ALTO_OUT))
         canvas.paste(frame_izq, (0, 0))
         canvas.paste(frame_cen, (out_x1, 0))
@@ -186,7 +180,7 @@ def crear_clip_biombo_3d(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40, a
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-continuous-biombo-3d"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-biombo-fino"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -211,34 +205,37 @@ def generar_video():
         for ruta in archivos_temp:
             imagenes_pil.append(preparar_imagen_16_9(ruta))
 
-        # 1. Portada: Acelera con apertura suave de laterales hacia la fachada
-        c1 = crear_clip_biombo_3d(
+        # 1. Portada: Acelera con empuje frontal decidido hacia la puerta (zoom 36%)
+        c1 = crear_clip_biombo_fino(
             imagenes_pil[0],
-            duracion=2.4,
+            duracion=2.3,
             modo="acelerar",
             sesgo_y=0.45,
-            apertura_muros=0.18
+            zoom_ratio=0.36,
+            apertura_extremos=0.20
         )
 
-        # 2. Hall: Velocidad crucero continua, paredes laterales abriéndose al pasar
-        c2 = crear_clip_biombo_3d(
+        # 2. Hall: Velocidad crucero alta, horizonte corregido al 38%
+        c2 = crear_clip_biombo_fino(
             imagenes_pil[1],
-            duracion=2.4,
+            duracion=2.3,
             modo="crucero",
             sesgo_y=0.38,
-            apertura_muros=0.22
+            zoom_ratio=0.32,
+            apertura_extremos=0.24
         )
 
-        # 3. Quincho: Desacelera suave en el patio
-        c3 = crear_clip_biombo_3d(
+        # 3. Quincho: Desacelera suave hacia la piscina
+        c3 = crear_clip_biombo_fino(
             imagenes_pil[2],
-            duracion=2.6,
+            duracion=2.5,
             modo="desacelerar",
             sesgo_y=0.44,
-            apertura_muros=0.16
+            zoom_ratio=0.26,
+            apertura_extremos=0.18
         )
 
-        # Flashazo seco de 1 frame (0.04s)
+        # Destello de 1 frame (0.04s)
         f1 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
         f2 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
 
