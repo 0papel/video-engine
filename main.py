@@ -8,7 +8,7 @@ from PIL import Image
 # Compatibilidad Pillow / MoviePy
 if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.Resampling.LANCZOS
-
+    
 from moviepy.editor import VideoClip, ColorClip, concatenate_videoclips
 import cloudinary
 import cloudinary.uploader
