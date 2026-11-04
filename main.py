@@ -22,22 +22,10 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# Ventana más compacta: mayor densidad de píxeles, cero pixelación y render más rápido
-ANCHO = 960
-ALTO = 540
+# Formato Vertical Celular (9:16 compacto para máxima nitidez y bajo consumo de RAM)
+ANCHO = 360
+ALTO = 640
 FPS = 15
-
-def calcular_coeficientes_perspectiva(pa, pb):
-    matrix = []
-    for p1, p2 in zip(pa, pb):
-        matrix.append([p1[0], p1[1], 1, 0, 0, 0, -p2[0]*p1[0], -p2[0]*p1[1]])
-        matrix.append([0, 0, 0, p1[0], p1[1], 1, -p2[1]*p1[0], -p2[1]*p1[1]])
-    
-    A = np.matrix(matrix, dtype=float)
-    B = np.array(pb).reshape(8)
-    
-    res = np.dot(np.linalg.inv(A.T * A) * A.T, B)
-    return np.array(res).reshape(8)
 
 def descargar_imagen(url, ruta_salida):
     r = requests.get(url, stream=True, timeout=15)
@@ -46,50 +34,63 @@ def descargar_imagen(url, ruta_salida):
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
 
-def crear_clip_incursion_3d(ruta_img, duracion=3.0, intensidad_fuga=0.14):
+def preparar_recorte_vertical(img_pil):
     """
-    Incursión hacia el interior de la habitación:
-    - Centro estabilizado (cero paneo lateral distractivo).
-    - Avance frontal pronunciado (push-in).
-    - Homografía trapezoidal agresiva: los bordes se abren hacia los lados
-      simulando que las paredes pasan a los costados del observador.
+    Toma la foto en alta resolución nativa y extrae el encuadre 9:16 central
+    SIN bajarle resolución previa para evitar pixelaciones.
     """
-    img_base = Image.open(ruta_img).convert("RGB")
-    # Redimensionar al canvas compacto manteniendo calidad de origen
-    img_base = img_base.resize((ANCHO, ALTO), Image.Resampling.LANCZOS)
-    w, h = ANCHO, ALTO
+    w_orig, h_orig = img_pil.size
+    ratio_destino = ANCHO / ALTO  # 9/16 = 0.5625
+    ratio_orig = w_orig / h_orig
 
-    pts_dst = [(0, 0), (w, 0), (w, h), (0, h)]
+    if ratio_orig > ratio_destino:
+        # La foto es más ancha: recortamos los laterales al centro
+        nuevo_w = int(h_orig * ratio_destino)
+        offset_x = (w_orig - nuevo_w) // 2
+        crop_box = (offset_x, 0, offset_x + nuevo_w, h_orig)
+    else:
+        # La foto es más alta: recortamos arriba/abajo al centro
+        nuevo_h = int(w_orig / ratio_destino)
+        offset_y = (h_orig - nuevo_h) // 2
+        crop_box = (0, offset_y, w_orig, offset_y + nuevo_h)
+
+    return img_pil.crop(crop_box)
+
+def crear_clip_vertical_inmersivo(ruta_img, duracion=2.8, zoom_max=0.20):
+    """
+    Genera un avance frontal (push-in) suave sobre la foto en alta resolución nativa,
+    escalando únicamente al frame final 360x640 para mantener máxima definición.
+    """
+    img_raw = Image.open(ruta_img).convert("RGB")
+    # Base 9:16 recortada en alta resolución
+    img_base = preparar_recorte_vertical(img_raw)
+    bw, bh = img_base.size
 
     def make_frame(t):
         progreso = t / duracion
         
-        # 1. Avance frontal en Z (Zoom in centrado, sin traslación en X)
-        zoom_x = progreso * (w * 0.14)
-        zoom_y = progreso * (h * 0.14)
+        # Factor de avance progresivo (zoom in frontal)
+        factor = 1.0 + (progreso * zoom_max)
         
-        # 2. Deformación trapezoidal de perspectiva (Fuga cónica)
-        # Los extremos verticales se expanden hacia afuera mientras avanzamos
-        fuga_vertical = (progreso * intensidad_fuga) * h
-        fuga_horizontal = (progreso * (intensidad_fuga * 0.5)) * w
+        # Dimensiones de la ventana de captura en alta resolución
+        cw = int(bw / factor)
+        ch = int(bh / factor)
         
-        # Coordenadas fuente con distorsión de túnel
-        pts_src = [
-            (zoom_x - fuga_horizontal, zoom_y - fuga_vertical),          # Sup Izq
-            (w - zoom_x + fuga_horizontal, zoom_y - fuga_vertical),      # Sup Der
-            (w - zoom_x + fuga_horizontal, h - zoom_y + fuga_vertical),  # Inf Der
-            (zoom_x - fuga_horizontal, h - zoom_y + fuga_vertical)       # Inf Izq
-        ]
+        # Centrado dinámico
+        left = (bw - cw) // 2
+        top = (bh - ch) // 2
         
-        coeffs = calcular_coeficientes_perspectiva(pts_dst, pts_src)
-        frame_trans = img_base.transform((w, h), Image.PERSPECTIVE, coeffs, Image.BILINEAR)
-        return np.array(frame_trans)
+        # Recorte de la ventana y resize final a 360x640 usando interpolación Lanczos limpia
+        frame_crop = img_base.crop((left, top, left + cw, top + ch))
+        frame_final = frame_crop.resize((ANCHO, ALTO), Image.Resampling.LANCZOS)
+        
+        return np.array(frame_final)
 
     return VideoClip(make_frame, duration=duracion)
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-push-in-3d"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-vertical-9-16"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -98,29 +99,31 @@ def generar_video():
     id_propiedad = data.get("id", "tour")
 
     if len(urls) < 3:
-        return jsonify({"error": "Se requieren 3 fotos"}), 400
+        return jsonify({"error": "Se requieren al menos 3 fotos"}), 400
 
     archivos_temp = []
     video_path = None
 
     try:
+        # 1. Descarga temporal de las fotos
         for url in urls[:3]:
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             tmp.close()
             descargar_imagen(url, tmp.name)
             archivos_temp.append(tmp.name)
 
-        # 3 tomas con empuje hacia adentro y distorsión calibrada
-        c1 = crear_clip_incursion_3d(archivos_temp[0], duracion=2.8, intensidad_fuga=0.13)
-        c2 = crear_clip_incursion_3d(archivos_temp[1], duracion=2.8, intensidad_fuga=0.15)
-        c3 = crear_clip_incursion_3d(archivos_temp[2], duracion=2.8, intensidad_fuga=0.13)
+        # 2. Clips verticales con avance frontal puro
+        c1 = crear_clip_vertical_inmersivo(archivos_temp[0], duracion=2.8, zoom_max=0.18)
+        c2 = crear_clip_vertical_inmersivo(archivos_temp[1], duracion=2.8, zoom_max=0.22)
+        c3 = crear_clip_vertical_inmersivo(archivos_temp[2], duracion=2.8, zoom_max=0.18)
 
-        # Flashazo blanco seco y limpio (0.15s) entre tomas
+        # 3. Flashes blancos verticales de transición (0.15s)
         f1 = ColorClip(size=(ANCHO, ALTO), color=(255, 255, 255), duration=0.15)
         f2 = ColorClip(size=(ANCHO, ALTO), color=(255, 255, 255), duration=0.15)
 
         video_completo = concatenate_videoclips([c1, f1, c2, f2, c3], method="compose")
 
+        # 4. Renderizado ultraliviano vertical
         tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         video_path = tmp_video.name
         tmp_video.close()
@@ -134,6 +137,7 @@ def generar_video():
             threads=1
         )
 
+        # 5. Subida a Cloudinary
         upload_result = cloudinary.uploader.upload(
             video_path,
             resource_type="video",
