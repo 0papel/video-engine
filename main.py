@@ -23,7 +23,7 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# Widescreen 16:9 optimizado para estabilidad en Render Free
+# Widescreen 16:9 optimizado (liviano, estable y nítido)
 ANCHO_OUT = 640
 ALTO_OUT = 360
 FPS = 30
@@ -36,20 +36,15 @@ def descargar_imagen(url, ruta_salida):
             f.write(chunk)
 
 def preparar_imagen_16_9(ruta_img):
-    """
-    Normaliza la foto a proporción 16:9 nativa y limita el tamaño en memoria
-    para asegurar que nunca supere el techo de 512 MB de Render.
-    """
     img = Image.open(ruta_img).convert("RGB")
     w, h = img.size
 
-    # Limitar resolución máxima de trabajo a 1600px en el eje mayor
+    # Limitar resolución para blindar los 512 MB de RAM de Render
     if max(w, h) > 1600:
         escala = 1600.0 / max(w, h)
         img = img.resize((int(w * escala), int(h * escala)), Image.Resampling.BILINEAR)
         w, h = img.size
 
-    # Ajuste de lienzo base a 16:9 exacto mediante crop central si difiere
     ratio_target = 16.0 / 9.0
     ratio_actual = w / float(h)
 
@@ -64,39 +59,39 @@ def preparar_imagen_16_9(ruta_img):
 
     return img
 
-def crear_clip_incursion_continua(img_base, duracion=2.6, zoom_ratio=0.20, modo="suave"):
+def crear_clip_incursion_focal(img_base, duracion=2.5, zoom_ratio=0.25, modo="crucero", sesgo_y=0.40):
     """
-    Incursión hacia adelante con perfiles de velocidad cinemáticos:
-    - 'acelerar': arranca pausado y culmina a máxima velocidad contra la puerta.
-    - 'desacelerar': entra rápido (recibiendo la inercia) y suaviza adentro.
-    - 'suave': curva Hermite simétrica para planos estables.
+    Control cinemático con punto de fuga corregido:
+    - sesgo_y: ajusta la altura del anclaje (0.40 evita que la cámara mire hacia el piso).
+    - modo 'acelerar': arranca suave y termina a fondo (Foto 1).
+    - modo 'crucero': velocidad continua alta constante sin frenar (Foto 2).
+    - modo 'desacelerar': entra rápido y frena suave al fondo (Foto 3).
     """
     w_orig, h_orig = img_base.size
 
-    # Centro óptico estándar
     cx = w_orig / 2.0
-    cy = h_orig * 0.50
+    cy = h_orig * sesgo_y  # Punto de fuga anclado al horizonte/fondo
 
     def make_frame(t):
         p = max(0.0, min(1.0, t / duracion))
 
-        # Curvas de aceleración cinemática
         if modo == "acelerar":
-            # Cuadrática creciente: la cámara se embala hacia el final
+            # Cuadrática creciente: toma velocidad hacia el corte
             factor_mov = p * p
+        elif modo == "crucero":
+            # Lineal sostenido: mantiene el empuje adquirido
+            factor_mov = p
         elif modo == "desacelerar":
-            # Cuadrática decreciente: recibe el empuje del corte y desacelera
+            # Cuadrática decreciente: entra embalado y suaviza al final
             factor_mov = 1.0 - (1.0 - p) * (1.0 - p)
         else:
-            # Hermite estándar (Smoothstep)
             factor_mov = p * p * (3.0 - 2.0 * p)
 
-        # Reducción progresiva de la ventana de captura (Push-In)
         escala = 1.0 - (factor_mov * zoom_ratio)
         w_actual = w_orig * escala
         h_actual = h_orig * escala
 
-        # Coordenadas en coma flotante (sub-píxel)
+        # Límites con sub-píxel continuo
         x0 = cx - (w_actual / 2.0)
         y0 = cy - (h_actual / 2.0)
         x1 = x0 + w_actual
@@ -115,7 +110,7 @@ def crear_clip_incursion_continua(img_base, duracion=2.6, zoom_ratio=0.20, modo=
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-16-9-match-cut"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-horizon-fixed"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -131,38 +126,35 @@ def generar_video():
     video_path = None
 
     try:
-        # Descarga a disco
         for url in urls[:3]:
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             tmp.close()
             descargar_imagen(url, tmp.name)
             archivos_temp.append(tmp.name)
 
-        # Normalizar imágenes en memoria a 16:9
         for ruta in archivos_temp:
             imagenes_pil.append(preparar_imagen_16_9(ruta))
 
-        # 1. Fachada / Portada: Incursión rápida que acelera hacia la puerta
-        c1 = crear_clip_incursion_continua(imagenes_pil[0], duracion=2.5, zoom_ratio=0.32, modo="acelerar")
+        # 1. Portada/Fachada: Incursión que acelera hacia el acceso (sesgo Y 45%)
+        c1 = crear_clip_incursion_focal(imagenes_pil[0], duracion=2.4, zoom_ratio=0.30, modo="acelerar", sesgo_y=0.45)
 
-        # 2. Hall interior: Entra rápido absorbiendo la inercia anterior y suaviza
-        c2 = crear_clip_incursion_continua(imagenes_pil[1], duracion=2.7, zoom_ratio=0.16, modo="desacelerar")
+        # 2. Hall/Pasillo: Mantiene la velocidad de avance continua sin mirar al piso (sesgo Y 38%)
+        c2 = crear_clip_incursion_focal(imagenes_pil[1], duracion=2.4, zoom_ratio=0.28, modo="crucero", sesgo_y=0.38)
 
-        # 3. Terraza / Patio: Recorrido continuo estable
-        c3 = crear_clip_incursion_continua(imagenes_pil[2], duracion=2.6, zoom_ratio=0.18, modo="suave")
+        # 3. Quincho/Piscina: Entra con la inercia y desacelera suave en el patio (sesgo Y 44%)
+        c3 = crear_clip_incursion_focal(imagenes_pil[2], duracion=2.6, zoom_ratio=0.22, modo="desacelerar", sesgo_y=0.44)
 
-        # Destello casi imperceptible (0.04s son exactamente 1 frame a 30 FPS)
+        # Destellos casi imperceptibles de 0.04s (1 fotograma a 30 FPS)
         f1 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
         f2 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
 
-        # Montaje continuo
         video_completo = concatenate_videoclips([c1, f1, c2, f2, c3], method="compose")
 
         tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         video_path = tmp_video.name
         tmp_video.close()
 
-        # Renderizado en C con preset ultrafast y buffer acotado
+        # Renderizado liviano con buffer acotado
         video_completo.write_videofile(
             video_path,
             fps=FPS,
@@ -173,7 +165,6 @@ def generar_video():
             threads=1
         )
 
-        # Limpieza estricta de memoria
         video_completo.close()
         c1.close()
         c2.close()
@@ -182,7 +173,6 @@ def generar_video():
             img.close()
         gc.collect()
 
-        # Subida a Cloudinary
         upload_result = cloudinary.uploader.upload(
             video_path,
             resource_type="video",
