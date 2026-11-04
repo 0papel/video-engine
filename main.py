@@ -4,7 +4,7 @@ import requests
 import tempfile
 import numpy as np
 from flask import Flask, request, jsonify
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 
 # Compatibilidad Pillow / MoviePy
 if not hasattr(Image, 'ANTIALIAS'):
@@ -23,7 +23,7 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# 16:9 widescreen limpio, ultra estable y sin artefactos
+# Widescreen 16:9 optimizado para estabilidad en Render Free
 ANCHO_OUT = 640
 ALTO_OUT = 360
 FPS = 30
@@ -59,22 +59,47 @@ def preparar_imagen_16_9(ruta_img):
 
     return img
 
-def crear_clip_incursion_continua(img_base, duracion=2.5, zoom_ratio=0.25, modo="crucero", sesgo_y=0.40):
+def generar_mascara_marco(ancho, alto, sesgo_y=0.40):
     """
-    Incursión continua cinematográfica (paño único sin costuras ni deformaciones raras):
-    - sesgo_y: ancla la cámara a la altura de la vista (0.38 evita mirar al suelo).
-    - modo 'acelerar': arranca suave y termina a fondo contra el acceso.
-    - modo 'crucero': sostiene la velocidad lineal adquirida.
-    - modo 'desacelerar': frena con suavidad en el plano final.
+    Genera una máscara alfa con el centro transparente y bordes suaves (feathered),
+    dejando opacas las paredes laterales, marco superior y primer plano.
+    """
+    mask = Image.new("L", (ancho, alto), 255)
+    draw = ImageDraw.Draw(mask)
+    
+    cx = ancho / 2.0
+    cy = alto * sesgo_y
+    
+    # Radio del túnel central
+    rx = ancho * 0.36
+    ry = alto * 0.40
+    
+    bbox = [cx - rx, cy - ry, cx + rx, cy + ry]
+    draw.ellipse(bbox, fill=0)
+    
+    # Difuminado gaussiano amplio para fusión orgánica sin cortes secos
+    mask_blur = mask.filter(ImageFilter.GaussianBlur(radius=int(alto * 0.12)))
+    return mask_blur
+
+def crear_clip_parallax_dos_capas(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40):
+    """
+    Parallax procedural en 2 capas:
+    - Capa Fondo: avance suave hacia el centro.
+    - Capa Marco (Frontal): se expande agresivamente hacia afuera y sale del cuadro.
     """
     w_orig, h_orig = img_base.size
-
     cx = w_orig / 2.0
     cy = h_orig * sesgo_y
+
+    # Preparar capa frontal con transparencia central
+    mascara = generar_mascara_marco(w_orig, h_orig, sesgo_y=sesgo_y)
+    img_front = img_base.copy()
+    img_front.putalpha(mascara)
 
     def make_frame(t):
         p = max(0.0, min(1.0, t / duracion))
 
+        # Curva de inercia según toma
         if modo == "acelerar":
             factor_mov = p * p
         elif modo == "crucero":
@@ -84,30 +109,50 @@ def crear_clip_incursion_continua(img_base, duracion=2.5, zoom_ratio=0.25, modo=
         else:
             factor_mov = p * p * (3.0 - 2.0 * p)
 
-        escala = 1.0 - (factor_mov * zoom_ratio)
-        w_actual = w_orig * escala
-        h_actual = h_orig * escala
-
-        # Límites en coma flotante continua (sub-píxel, cero tirones)
-        x0 = cx - (w_actual / 2.0)
-        y0 = cy - (h_actual / 2.0)
-        x1 = x0 + w_actual
-        y1 = y0 + h_actual
-
-        frame_pil = img_base.transform(
+        # 1. RENDER CAPA FONDO (Push-in moderado: 12% a 18%)
+        zoom_fondo = 1.0 - (factor_mov * 0.14)
+        bw_bg = w_orig * zoom_fondo
+        bh_bg = h_orig * zoom_fondo
+        bg_box = (
+            cx - (bw_bg / 2.0),
+            cy - (bh_bg / 2.0),
+            cx + (bw_bg / 2.0),
+            cy + (bh_bg / 2.0)
+        )
+        frame_bg = img_base.transform(
             (ANCHO_OUT, ALTO_OUT),
             Image.EXTENT,
-            (x0, y0, x1, y1),
+            bg_box,
+            Image.Resampling.BILINEAR
+        ).convert("RGBA")
+
+        # 2. RENDER CAPA FRONTAL (Expansión rápida hacia afuera: 35%)
+        # El marco se abre velozmente simulando que la cámara pasa a su lado
+        zoom_front = 1.0 - (factor_mov * 0.35)
+        bw_fg = w_orig * zoom_front
+        bh_fg = h_orig * zoom_front
+        fg_box = (
+            cx - (bw_fg / 2.0),
+            cy - (bh_fg / 2.0),
+            cx + (bw_fg / 2.0),
+            cy + (bh_fg / 2.0)
+        )
+        frame_fg = img_front.transform(
+            (ANCHO_OUT, ALTO_OUT),
+            Image.EXTENT,
+            fg_box,
             Image.Resampling.BILINEAR
         )
 
-        return np.array(frame_pil)
+        # 3. Composición Alpha (Frontal sobre Fondo)
+        frame_comp = Image.alpha_composite(frame_bg, frame_fg).convert("RGB")
+        return np.array(frame_comp)
 
     return VideoClip(make_frame, duration=duracion)
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-pushin-clean"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-procedural-parallax"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -132,16 +177,16 @@ def generar_video():
         for ruta in archivos_temp:
             imagenes_pil.append(preparar_imagen_16_9(ruta))
 
-        # 1. Portada: Incursión que acelera hacia el acceso (sesgo Y 45%)
-        c1 = crear_clip_incursion_continua(imagenes_pil[0], duracion=2.4, zoom_ratio=0.30, modo="acelerar", sesgo_y=0.45)
+        # 1. Portada: Empuja hacia la entrada
+        c1 = crear_clip_parallax_dos_capas(imagenes_pil[0], duracion=2.4, modo="acelerar", sesgo_y=0.45)
 
-        # 2. Hall: Velocidad crucero continua, horizonte elevado al 38% para ver la terraza
-        c2 = crear_clip_incursion_continua(imagenes_pil[1], duracion=2.4, zoom_ratio=0.28, modo="crucero", sesgo_y=0.38)
+        # 2. Hall: Los muros laterales y marcos se abren a los lados mientras el fondo avanza continuo
+        c2 = crear_clip_parallax_dos_capas(imagenes_pil[1], duracion=2.4, modo="crucero", sesgo_y=0.38)
 
-        # 3. Quincho: Entra con inercia y frena suave en el patio
-        c3 = crear_clip_incursion_continua(imagenes_pil[2], duracion=2.6, zoom_ratio=0.22, modo="desacelerar", sesgo_y=0.44)
+        # 3. Quincho/Piscina: La pérgola superior y pilares se expanden y frena suave en el jardín
+        c3 = crear_clip_parallax_dos_capas(imagenes_pil[2], duracion=2.6, modo="desacelerar", sesgo_y=0.44)
 
-        # Destellos casi imperceptibles de 0.04s (1 frame a 30 FPS)
+        # Destello de 1 frame (0.04s)
         f1 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
         f2 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
 
