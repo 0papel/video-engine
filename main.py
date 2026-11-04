@@ -23,7 +23,7 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# 16:9 widescreen estándar optimizado (liviano, estable y continuo)
+# 16:9 widescreen estándar optimizado (liviano, estable y sin costuras)
 ANCHO_OUT = 640
 ALTO_OUT = 360
 FPS = 30
@@ -59,50 +59,37 @@ def preparar_imagen_16_9(ruta_img):
 
     return img
 
-def calcular_coeficientes_perspectiva(pa, pb):
-    """Calcula coeficientes homográficos para Image.PERSPECTIVE."""
-    matrix = []
-    for p1, p2 in zip(pa, pb):
-        matrix.append([p1[0], p1[1], 1, 0, 0, 0, -p2[0]*p1[0], -p2[0]*p1[1]])
-        matrix.append([0, 0, 0, p1[0], p1[1], 1, -p2[1]*p1[0], -p2[1]*p1[1]])
-    
-    A = np.matrix(matrix, dtype=float)
-    B = np.array(pb).reshape(8)
-    res = np.dot(np.linalg.inv(A.T * A) * A.T, B)
-    return np.array(res).reshape(8)
-
-def crear_clip_biombo_fino(img_base, duracion=2.4, modo="crucero", sesgo_y=0.40, zoom_ratio=0.35, apertura_extremos=0.25):
+def crear_clip_flujo_relativista(img_base, duracion=2.4, modo="crucero", sesgo_y=0.40, v_centro=0.18, v_periferia=0.32):
     """
-    Biombo calibrado con marco central amplio (84% centro, 8% laterales):
-    - Centro completo sin cortes que rompan logos o la estructura principal.
-    - Muros laterales delgados que se abren a los lados para dar volumen.
+    Simulación de avance continuo con gradiente de velocidad radial:
+    - Centro: avance suave hacia el fondo.
+    - Laterales: velocidad diferencial no lineal hacia afuera (sensación de paso de paredes).
+    - Cero cortes, paño 100% continuo.
     """
-    w_orig, h_orig = img_base.size
+    img_arr = np.array(img_base, dtype=np.uint8)
+    h_orig, w_orig, _ = img_arr.shape
 
-    # Partición: 8% Izquierda - 84% Centro - 8% Derecha
-    FRAC_LATERAL = 0.08
-    x_c1 = w_orig * FRAC_LATERAL
-    x_c2 = w_orig * (1.0 - FRAC_LATERAL)
+    # Grilla de coordenadas normalizadas en el canvas de salida
+    y_idx, x_idx = np.indices((ALTO_OUT, ANCHO_OUT), dtype=np.float32)
 
-    img_izq = img_base.crop((0, 0, int(x_c1), h_orig))
-    img_cen = img_base.crop((int(x_c1), 0, int(x_c2), h_orig))
-    img_der = img_base.crop((int(x_c2), 0, w_orig, h_orig))
+    cx_out = ANCHO_OUT / 2.0
+    cy_out = ALTO_OUT * sesgo_y
 
-    w_izq = int(x_c1)
-    w_cen = int(x_c2 - x_c1)
-    w_der = int(w_orig - x_c2)
+    # Vector distancia radial normalizada desde el punto de fuga (0 en centro, ~1 en bordes)
+    dx_norm = (x_idx - cx_out) / (ANCHO_OUT / 2.0)
+    dy_norm = (y_idx - cy_out) / (ALTO_OUT / 2.0)
+    radio = np.sqrt(dx_norm**2 + dy_norm**2)
+    # Exponente de curvatura: el centro se mantiene plano y la periferia se dispara
+    periferia_curva = np.power(radio, 1.6)
 
-    # Anchos destino base en pantalla
-    out_x1 = int(ANCHO_OUT * FRAC_LATERAL)
-    out_x2 = int(ANCHO_OUT * (1.0 - FRAC_LATERAL))
-    out_w_izq = out_x1
-    out_w_cen = out_x2 - out_x1
-    out_w_der = ANCHO_OUT - out_x2
+    # Centro focal en la imagen original
+    cx_src = w_orig / 2.0
+    cy_src = h_orig * sesgo_y
 
     def make_frame(t):
         p = max(0.0, min(1.0, t / duracion))
 
-        # Curva cinemática
+        # Perfil cinemático
         if modo == "acelerar":
             f = p * p
         elif modo == "crucero":
@@ -112,75 +99,28 @@ def crear_clip_biombo_fino(img_base, duracion=2.4, modo="crucero", sesgo_y=0.40,
         else:
             f = p * p * (3.0 - 2.0 * p)
 
-        # 1. Movimiento frontal decidido hacia el fondo
-        zoom_cen = 1.0 - (f * zoom_ratio)
-        cw = w_cen * zoom_cen
-        ch = h_orig * zoom_cen
-        cx_c = w_cen / 2.0
-        cy_c = h_orig * sesgo_y
+        # Factor de expansión no lineal:
+        # El centro escala con v_centro, los laterales se aceleran con v_periferia
+        factor_escala = 1.0 + f * (v_centro + (v_periferia * periferia_curva))
 
-        box_cen = (
-            cx_c - (cw / 2.0),
-            cy_c - (ch / 2.0),
-            cx_c + (cw / 2.0),
-            cy_c + (ch / 2.0)
-        )
-        frame_cen = img_cen.transform(
-            (out_w_cen, ALTO_OUT),
-            Image.EXTENT,
-            box_cen,
-            Image.Resampling.BILINEAR
-        )
+        # Mapeo inverso de coordenadas hacia la imagen original
+        # A mayor factor_escala en pantalla, la coordenada de origen se contrae hacia el centro
+        src_x = cx_src + ((x_idx - cx_out) * (w_orig / ANCHO_OUT)) / factor_escala
+        src_y = cy_src + ((y_idx - cy_out) * (h_orig / ALTO_OUT)) / factor_escala
 
-        # 2. Deformación de las franjas laterales delgadas
-        delta_v = (f * apertura_extremos) * (ALTO_OUT * 0.30)
-        delta_h = (f * apertura_extremos) * (out_w_izq * 0.40)
+        # Clamping dentro de los límites de la matriz
+        src_x = np.clip(src_x, 0, w_orig - 1).astype(np.int32)
+        src_y = np.clip(src_y, 0, h_orig - 1).astype(np.int32)
 
-        # Muro Izquierdo: arista interior soldada al centro, arista exterior se abre
-        pts_dst_izq = [(0, 0), (out_w_izq, 0), (out_w_izq, ALTO_OUT), (0, ALTO_OUT)]
-        pts_src_izq = [
-            (delta_h, delta_v),
-            (w_izq, 0),
-            (w_izq, h_orig),
-            (delta_h, h_orig - delta_v)
-        ]
-        coeffs_izq = calcular_coeficientes_perspectiva(pts_dst_izq, pts_src_izq)
-        frame_izq = img_izq.transform(
-            (out_w_izq, ALTO_OUT),
-            Image.PERSPECTIVE,
-            coeffs_izq,
-            Image.Resampling.BILINEAR
-        )
-
-        # Muro Derecho: arista interior soldada al centro, arista exterior se abre
-        pts_dst_der = [(0, 0), (out_w_der, 0), (out_w_der, ALTO_OUT), (0, ALTO_OUT)]
-        pts_src_der = [
-            (0, 0),
-            (w_der - delta_h, delta_v),
-            (w_der - delta_h, h_orig - delta_v),
-            (0, h_orig)
-        ]
-        coeffs_der = calcular_coeficientes_perspectiva(pts_dst_der, pts_src_der)
-        frame_der = img_der.transform(
-            (out_w_der, ALTO_OUT),
-            Image.PERSPECTIVE,
-            coeffs_der,
-            Image.Resampling.BILINEAR
-        )
-
-        # 3. Pegado sin costuras
-        canvas = Image.new("RGB", (ANCHO_OUT, ALTO_OUT))
-        canvas.paste(frame_izq, (0, 0))
-        canvas.paste(frame_cen, (out_x1, 0))
-        canvas.paste(frame_der, (out_x2, 0))
-
-        return np.array(canvas)
+        # Reconstrucción instantánea por indexación NumPy
+        frame = img_arr[src_y, src_x]
+        return frame
 
     return VideoClip(make_frame, duration=duracion)
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-biombo-fino"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-radial-flow"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -205,37 +145,37 @@ def generar_video():
         for ruta in archivos_temp:
             imagenes_pil.append(preparar_imagen_16_9(ruta))
 
-        # 1. Portada: Acelera con empuje frontal decidido hacia la puerta (zoom 36%)
-        c1 = crear_clip_biombo_fino(
+        # 1. Portada: Empuje acelerado hacia la puerta
+        c1 = crear_clip_flujo_relativista(
             imagenes_pil[0],
-            duracion=2.3,
+            duracion=2.4,
             modo="acelerar",
             sesgo_y=0.45,
-            zoom_ratio=0.36,
-            apertura_extremos=0.20
+            v_centro=0.22,
+            v_periferia=0.35
         )
 
-        # 2. Hall: Velocidad crucero alta, horizonte corregido al 38%
-        c2 = crear_clip_biombo_fino(
+        # 2. Hall: Velocidad crucero continua, paredes laterales pasando rápido
+        c2 = crear_clip_flujo_relativista(
             imagenes_pil[1],
-            duracion=2.3,
+            duracion=2.4,
             modo="crucero",
             sesgo_y=0.38,
-            zoom_ratio=0.32,
-            apertura_extremos=0.24
+            v_centro=0.20,
+            v_periferia=0.38
         )
 
-        # 3. Quincho: Desacelera suave hacia la piscina
-        c3 = crear_clip_biombo_fino(
+        # 3. Quincho: Freno suave en el patio
+        c3 = crear_clip_flujo_relativista(
             imagenes_pil[2],
-            duracion=2.5,
+            duracion=2.6,
             modo="desacelerar",
             sesgo_y=0.44,
-            zoom_ratio=0.26,
-            apertura_extremos=0.18
+            v_centro=0.15,
+            v_periferia=0.28
         )
 
-        # Destello de 1 frame (0.04s)
+        # Destellos secos de 1 frame (0.04s)
         f1 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
         f2 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
 
