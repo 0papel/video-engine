@@ -4,7 +4,7 @@ import requests
 import tempfile
 import numpy as np
 from flask import Flask, request, jsonify
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image
 
 # Compatibilidad Pillow / MoviePy
 if not hasattr(Image, 'ANTIALIAS'):
@@ -23,7 +23,7 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# Widescreen 16:9 optimizado para estabilidad en Render Free
+# 16:9 widescreen estándar optimizado
 ANCHO_OUT = 640
 ALTO_OUT = 360
 FPS = 30
@@ -39,7 +39,7 @@ def preparar_imagen_16_9(ruta_img):
     img = Image.open(ruta_img).convert("RGB")
     w, h = img.size
 
-    # Limitar resolución para blindar los 512 MB de Render
+    # Limitar resolución para asegurar el techo de 512 MB de Render
     if max(w, h) > 1600:
         escala = 1600.0 / max(w, h)
         img = img.resize((int(w * escala), int(h * escala)), Image.Resampling.BILINEAR)
@@ -59,100 +59,134 @@ def preparar_imagen_16_9(ruta_img):
 
     return img
 
-def generar_mascara_marco(ancho, alto, sesgo_y=0.40):
-    """
-    Genera una máscara alfa con el centro transparente y bordes suaves (feathered),
-    dejando opacas las paredes laterales, marco superior y primer plano.
-    """
-    mask = Image.new("L", (ancho, alto), 255)
-    draw = ImageDraw.Draw(mask)
+def calcular_coeficientes_perspectiva(pa, pb):
+    """Calcula coeficientes homográficos para Image.PERSPECTIVE."""
+    matrix = []
+    for p1, p2 in zip(pa, pb):
+        matrix.append([p1[0], p1[1], 1, 0, 0, 0, -p2[0]*p1[0], -p2[0]*p1[1]])
+        matrix.append([0, 0, 0, p1[0], p1[1], 1, -p2[1]*p1[0], -p2[1]*p1[1]])
     
-    cx = ancho / 2.0
-    cy = alto * sesgo_y
-    
-    # Radio del túnel central
-    rx = ancho * 0.36
-    ry = alto * 0.40
-    
-    bbox = [cx - rx, cy - ry, cx + rx, cy + ry]
-    draw.ellipse(bbox, fill=0)
-    
-    # Difuminado gaussiano amplio para fusión orgánica sin cortes secos
-    mask_blur = mask.filter(ImageFilter.GaussianBlur(radius=int(alto * 0.12)))
-    return mask_blur
+    A = np.matrix(matrix, dtype=float)
+    B = np.array(pb).reshape(8)
+    res = np.dot(np.linalg.inv(A.T * A) * A.T, B)
+    return np.array(res).reshape(8)
 
-def crear_clip_parallax_dos_capas(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40):
+def crear_clip_biombo_3d(img_base, duracion=2.5, modo="crucero", sesgo_y=0.40, apertura_muros=0.20):
     """
-    Parallax procedural en 2 capas:
-    - Capa Fondo: avance suave hacia el centro.
-    - Capa Marco (Frontal): se expande agresivamente hacia afuera y sale del cuadro.
+    Proyección 2.5D en biombo continuo de 3 paños:
+    - Muro Izq (0 a 25% del ancho)
+    - Fondo Centro (25% a 75% del ancho)
+    - Muro Der (75% a 100% del ancho)
+    Las aristas compartidas se mantienen soldadas en todo momento.
     """
     w_orig, h_orig = img_base.size
-    cx = w_orig / 2.0
-    cy = h_orig * sesgo_y
 
-    # Preparar capa frontal con transparencia central
-    mascara = generar_mascara_marco(w_orig, h_orig, sesgo_y=sesgo_y)
-    img_front = img_base.copy()
-    img_front.putalpha(mascara)
+    # Puntos de corte de las franjas sobre la imagen original
+    x_c1 = w_orig * 0.25
+    x_c2 = w_orig * 0.75
+
+    # Cortes originales de los 3 paños
+    img_izq = img_base.crop((0, 0, int(x_c1), h_orig))
+    img_cen = img_base.crop((int(x_c1), 0, int(x_c2), h_orig))
+    img_der = img_base.crop((int(x_c2), 0, w_orig, h_orig))
+
+    w_izq = int(x_c1)
+    w_cen = int(x_c2 - x_c1)
+    w_der = int(w_orig - x_c2)
+
+    # Anchos destino base en el canvas final
+    out_x1 = int(ANCHO_OUT * 0.25)
+    out_x2 = int(ANCHO_OUT * 0.75)
+    out_w_izq = out_x1
+    out_w_cen = out_x2 - out_x1
+    out_w_der = ANCHO_OUT - out_x2
 
     def make_frame(t):
         p = max(0.0, min(1.0, t / duracion))
 
-        # Curva de inercia según toma
+        # Curva de inercia
         if modo == "acelerar":
-            factor_mov = p * p
+            f = p * p
         elif modo == "crucero":
-            factor_mov = p
+            f = p
         elif modo == "desacelerar":
-            factor_mov = 1.0 - (1.0 - p) * (1.0 - p)
+            f = 1.0 - (1.0 - p) * (1.0 - p)
         else:
-            factor_mov = p * p * (3.0 - 2.0 * p)
+            f = p * p * (3.0 - 2.0 * p)
 
-        # 1. RENDER CAPA FONDO (Push-in moderado: 12% a 18%)
-        zoom_fondo = 1.0 - (factor_mov * 0.14)
-        bw_bg = w_orig * zoom_fondo
-        bh_bg = h_orig * zoom_fondo
-        bg_box = (
-            cx - (bw_bg / 2.0),
-            cy - (bh_bg / 2.0),
-            cx + (bw_bg / 2.0),
-            cy + (bh_bg / 2.0)
-        )
-        frame_bg = img_base.transform(
-            (ANCHO_OUT, ALTO_OUT),
-            Image.EXTENT,
-            bg_box,
-            Image.Resampling.BILINEAR
-        ).convert("RGBA")
+        # 1. Movimiento del Fondo Central: Push-In moderado
+        zoom_cen = 1.0 - (f * 0.12)
+        cw = w_cen * zoom_cen
+        ch = h_orig * zoom_cen
+        cx_c = w_cen / 2.0
+        cy_c = h_orig * sesgo_y
 
-        # 2. RENDER CAPA FRONTAL (Expansión rápida hacia afuera: 35%)
-        # El marco se abre velozmente simulando que la cámara pasa a su lado
-        zoom_front = 1.0 - (factor_mov * 0.35)
-        bw_fg = w_orig * zoom_front
-        bh_fg = h_orig * zoom_front
-        fg_box = (
-            cx - (bw_fg / 2.0),
-            cy - (bh_fg / 2.0),
-            cx + (bw_fg / 2.0),
-            cy + (bh_fg / 2.0)
+        box_cen = (
+            cx_c - (cw / 2.0),
+            cy_c - (ch / 2.0),
+            cx_c + (cw / 2.0),
+            cy_c + (ch / 2.0)
         )
-        frame_fg = img_front.transform(
-            (ANCHO_OUT, ALTO_OUT),
+        frame_cen = img_cen.transform(
+            (out_w_cen, ALTO_OUT),
             Image.EXTENT,
-            fg_box,
+            box_cen,
             Image.Resampling.BILINEAR
         )
 
-        # 3. Composición Alpha (Frontal sobre Fondo)
-        frame_comp = Image.alpha_composite(frame_bg, frame_fg).convert("RGB")
-        return np.array(frame_comp)
+        # 2. Deformación de Muros Laterales (Homografía continua)
+        # Fuga vertical hacia los extremos exteriores
+        delta_v = (f * apertura_muros) * (ALTO_OUT * 0.35)
+        # Empuje horizontal hacia afuera
+        delta_h = (f * apertura_muros) * (out_w_izq * 0.30)
+
+        # Puntos destino para el paño izquierdo:
+        # Borde exterior izquierdo se expande hacia arriba, abajo y hacia afuera
+        pts_dst_izq = [(0, 0), (out_w_izq, 0), (out_w_izq, ALTO_OUT), (0, ALTO_OUT)]
+        pts_src_izq = [
+            (delta_h, delta_v),
+            (w_izq, 0),
+            (w_izq, h_orig),
+            (delta_h, h_orig - delta_v)
+        ]
+        coeffs_izq = calcular_coeficientes_perspectiva(pts_dst_izq, pts_src_izq)
+        frame_izq = img_izq.transform(
+            (out_w_izq, ALTO_OUT),
+            Image.PERSPECTIVE,
+            coeffs_izq,
+            Image.Resampling.BILINEAR
+        )
+
+        # Puntos destino para el paño derecho:
+        # Borde exterior derecho se expande simétricamente
+        pts_dst_der = [(0, 0), (out_w_der, 0), (out_w_der, ALTO_OUT), (0, ALTO_OUT)]
+        pts_src_der = [
+            (0, 0),
+            (w_der - delta_h, delta_v),
+            (w_der - delta_h, h_orig - delta_v),
+            (0, h_orig)
+        ]
+        coeffs_der = calcular_coeficientes_perspectiva(pts_dst_der, pts_src_der)
+        frame_der = img_der.transform(
+            (out_w_der, ALTO_OUT),
+            Image.PERSPECTIVE,
+            coeffs_der,
+            Image.Resampling.BILINEAR
+        )
+
+        # 3. Pegado de los tres paños contiguos en el frame final
+        canvas = Image.new("RGB", (ANCHO_OUT, ALTO_OUT))
+        canvas.paste(frame_izq, (0, 0))
+        canvas.paste(frame_cen, (out_x1, 0))
+        canvas.paste(frame_der, (out_x2, 0))
+
+        return np.array(canvas)
 
     return VideoClip(make_frame, duration=duracion)
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-procedural-parallax"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-continuous-biombo-3d"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -177,16 +211,34 @@ def generar_video():
         for ruta in archivos_temp:
             imagenes_pil.append(preparar_imagen_16_9(ruta))
 
-        # 1. Portada: Empuja hacia la entrada
-        c1 = crear_clip_parallax_dos_capas(imagenes_pil[0], duracion=2.4, modo="acelerar", sesgo_y=0.45)
+        # 1. Portada: Acelera con apertura suave de laterales hacia la fachada
+        c1 = crear_clip_biombo_3d(
+            imagenes_pil[0],
+            duracion=2.4,
+            modo="acelerar",
+            sesgo_y=0.45,
+            apertura_muros=0.18
+        )
 
-        # 2. Hall: Los muros laterales y marcos se abren a los lados mientras el fondo avanza continuo
-        c2 = crear_clip_parallax_dos_capas(imagenes_pil[1], duracion=2.4, modo="crucero", sesgo_y=0.38)
+        # 2. Hall: Velocidad crucero continua, paredes laterales abriéndose al pasar
+        c2 = crear_clip_biombo_3d(
+            imagenes_pil[1],
+            duracion=2.4,
+            modo="crucero",
+            sesgo_y=0.38,
+            apertura_muros=0.22
+        )
 
-        # 3. Quincho/Piscina: La pérgola superior y pilares se expanden y frena suave en el jardín
-        c3 = crear_clip_parallax_dos_capas(imagenes_pil[2], duracion=2.6, modo="desacelerar", sesgo_y=0.44)
+        # 3. Quincho: Desacelera suave en el patio
+        c3 = crear_clip_biombo_3d(
+            imagenes_pil[2],
+            duracion=2.6,
+            modo="desacelerar",
+            sesgo_y=0.44,
+            apertura_muros=0.16
+        )
 
-        # Destello de 1 frame (0.04s)
+        # Flashazo seco de 1 frame (0.04s)
         f1 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
         f2 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
 
