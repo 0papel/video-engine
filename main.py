@@ -3,7 +3,7 @@ import requests
 import tempfile
 from flask import Flask, request, jsonify
 
-# Parche de compatibilidad: Pillow 10+ eliminó ANTIALIAS, MoviePy 1.0.3 lo exige
+# Compatibilidad Pillow 10+ con MoviePy 1.0.3
 import PIL.Image
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
@@ -14,12 +14,16 @@ import cloudinary.uploader
 
 app = Flask(__name__)
 
-# Configuración Cloudinary (Cero Papel / Renewal)
+# Configuración Cloudinary
 cloudinary.config(
     cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", "oftxote2"),
     api_key=os.environ.get("CLOUDINARY_API_KEY", ""),
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
+
+ANCHO = 1280
+ALTO = 720
+FPS = 15
 
 def descargar_imagen(url, ruta_salida):
     r = requests.get(url, stream=True, timeout=15)
@@ -28,21 +32,19 @@ def descargar_imagen(url, ruta_salida):
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
 
-def crear_clip_zoom(ruta_img, duracion=3.5, zoom_inicial=1.0, zoom_final=1.18):
-    # Clip base en 16:9 ajustado a 1920x1080
+def crear_clip(ruta_img, duracion=2.5, zoom=1.12):
+    # Imagen base ajustada a 720p
     clip = (ImageClip(ruta_img)
-            .resize((1920, 1080))
+            .resize((ANCHO, ALTO))
             .set_duration(duracion))
     
-    # Zoom progresivo al centro con curva cuadrática
+    # Zoom lineal liviano
     def efecto_zoom(get_frame, t):
-        progreso = t / duracion
-        factor = zoom_inicial + (zoom_final - zoom_inicial) * (progreso ** 1.5)
+        factor = 1.0 + (zoom - 1.0) * (t / duracion)
         return clip.resize(factor).get_frame(t)
 
-    # Renderiza el avance centrado en 1920x1080
     clip_zoom = clip.fl(efecto_zoom)
-    return clip_zoom.crop(x_center=clip_zoom.w / 2, y_center=clip_zoom.h / 2, width=1920, height=1080)
+    return clip_zoom.crop(x_center=clip_zoom.w / 2, y_center=clip_zoom.h / 2, width=ANCHO, height=ALTO)
 
 @app.route("/", methods=["GET"])
 def health_check():
@@ -55,69 +57,68 @@ def generar_video():
     id_propiedad = data.get("id", "tour")
 
     if len(urls) < 3:
-        return jsonify({"error": "Se requieren exactamente 3 URLs de fotos (portada, living, terraza)"}), 400
+        return jsonify({"error": "Se requieren 3 fotos"}), 400
 
     archivos_temp = []
     video_path = None
 
     try:
-        # 1. Descargar las 3 imágenes temporales
-        for i, url in enumerate(urls[:3]):
+        # 1. Descarga temporal
+        for url in urls[:3]:
             tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
             tmp.close()
             descargar_imagen(url, tmp.name)
             archivos_temp.append(tmp.name)
 
-        # 2. Construir los 3 clips con avance hacia el centro
-        clip_fachada = crear_clip_zoom(archivos_temp[0], duracion=3.5, zoom_inicial=1.0, zoom_final=1.20)
-        clip_living  = crear_clip_zoom(archivos_temp[1], duracion=3.5, zoom_inicial=1.0, zoom_final=1.18)
-        clip_terraza = crear_clip_zoom(archivos_temp[2], duracion=3.5, zoom_inicial=1.0, zoom_final=1.12)
+        # 2. Clips rápidos (2.5s cada uno para no sobrecargar el render)
+        c1 = crear_clip(archivos_temp[0], duracion=2.5, zoom=1.12)
+        c2 = crear_clip(archivos_temp[1], duracion=2.5, zoom=1.10)
+        c3 = crear_clip(archivos_temp[2], duracion=2.5, zoom=1.08)
 
-        # 3. Flashazos blancos puros (whiteout de 0.25 segundos / ~8 cuadros)
-        flash1 = ColorClip(size=(1920, 1080), color=(255, 255, 255), duration=0.25)
-        flash2 = ColorClip(size=(1920, 1080), color=(255, 255, 255), duration=0.25)
+        # 3. Flashazos blancos de 0.2s
+        f1 = ColorClip(size=(ANCHO, ALTO), color=(255, 255, 255), duration=0.2)
+        f2 = ColorClip(size=(ANCHO, ALTO), color=(255, 255, 255), duration=0.2)
 
-        # 4. Secuencia continua: Fachada -> Flash -> Living -> Flash -> Terraza
-        video_completo = concatenate_videoclips(
-            [clip_fachada, flash1, clip_living, flash2, clip_terraza],
-            method="compose"
-        )
+        video_completo = concatenate_videoclips([c1, f1, c2, f2, c3], method="compose")
 
-        # 5. Renderizar MP4 temporal
+        # 4. Salida MP4 ligera (menos cuadros y preset ultrafast)
         tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         video_path = tmp_video.name
         tmp_video.close()
 
         video_completo.write_videofile(
             video_path,
-            fps=30,
+            fps=FPS,
             codec="libx264",
             audio=False,
-            preset="fast",
-            threads=2
+            preset="ultrafast",
+            threads=1
         )
 
-        # 6. Subida directa a Cloudinary
-        upload_result = cloudinary.uploader.upload_large(
+        # 5. Subida a Cloudinary
+        upload_result = cloudinary.uploader.upload(
             video_path,
             resource_type="video",
             public_id=f"tours/tour_{id_propiedad}",
             overwrite=True
         )
 
-        url_final = upload_result.get("secure_url")
-        return jsonify({"status": "completado", "url_video": url_final}), 200
+        return jsonify({
+            "status": "completado",
+            "url_video": upload_result.get("secure_url")
+        }), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
     finally:
-        # Limpieza de archivos temporales en memoria
         for ruta in archivos_temp:
             if os.path.exists(ruta):
-                os.remove(ruta)
+                try: os.remove(ruta)
+                except: pass
         if video_path and os.path.exists(video_path):
-            os.remove(video_path)
+            try: os.remove(video_path)
+            except: pass
 
 if __name__ == "__main__":
     puerto = int(os.environ.get("PORT", 8080))
