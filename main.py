@@ -22,10 +22,10 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# Geometría vertical y fluidez calibrada
+# 9:16 vertical de alta densidad
 ANCHO_OUT = 540
 ALTO_OUT = 960
-FPS = 45  # 45 FPS continuos para máxima suavidad cinemática
+FPS = 45
 
 def descargar_imagen(url, ruta_salida):
     r = requests.get(url, stream=True, timeout=15)
@@ -34,60 +34,66 @@ def descargar_imagen(url, ruta_salida):
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
 
-def crear_clip_paneo_fluido(ruta_img, duracion=2.6, direccion="izq_a_der"):
+def curva_suave(p):
+    """Curva Smoothstep (Hermite): aceleración y desaceleración fluida sin tirones."""
+    p = max(0.0, min(1.0, p))
+    return p * p * (3.0 - 2.0 * p)
+
+def crear_clip_incursion_frontal(ruta_img, duracion=2.8, zoom_ratio=0.18):
     """
-    Marco móvil vertical (9:16) sobre la foto panorámica de alta resolución.
-    Optimizado en C (Pillow BILINEAR) para sostener 45 FPS sin saturar la CPU de Render.
+    Push-in frontal cinematográfico (Dolly-in hacia el centro de la escena):
+    - Sub-pixel sampling continuo para matar los saltos entre cuadros.
+    - Curva de aceleración continua.
+    - Extrae el encuadre 9:16 nativo sobre la imagen original de alta resolución.
     """
     img_orig = Image.open(ruta_img).convert("RGB")
     w_orig, h_orig = img_orig.size
 
-    # Definir marco base 9:16 abarcando el alto total disponible
-    h_marco = int(h_orig * 0.96)
-    w_marco = int(h_marco * (ANCHO_OUT / ALTO_OUT))
+    # Definir el marco vertical 9:16 inicial sobre la imagen completa
+    h_box_base = float(h_orig)
+    w_box_base = h_box_base * (ANCHO_OUT / ALTO_OUT)
 
-    # Ajuste de bordes si la foto es angosta
-    if w_marco > w_orig:
-        w_marco = w_orig
-        h_marco = int(w_marco * (ALTO_OUT / ANCHO_OUT))
+    # Si la foto original es más angosta que 9:16, ajustamos por ancho
+    if w_box_base > w_orig:
+        w_box_base = float(w_orig)
+        h_box_base = w_box_base * (ALTO_OUT / ANCHO_OUT)
 
-    delta_x_max = w_orig - w_marco
+    # Centro focal de la imagen (donde apunta la cámara)
+    cx = w_orig / 2.0
+    # Ligero sesgo vertical al 48% para favorecer la línea de horizonte y perspectiva arquitectónica
+    cy = h_orig * 0.48
 
     def make_frame(t):
-        progreso = t / duracion
+        p = t / duracion
+        factor_suave = curva_suave(p)
 
-        # Incursión Z progresiva (el marco se reduce un 8% hacia el fondo)
-        zoom = 1.0 - (progreso * 0.08)
-        w_curr = w_marco * zoom
-        h_curr = h_marco * zoom
+        # Escala de la ventana: se reduce progresivamente (sensación de avance en profundidad)
+        escala = 1.0 - (factor_suave * zoom_ratio)
+        w_actual = w_box_base * escala
+        h_actual = h_box_base * escala
 
-        # Paneo horizontal suave
-        if direccion == "izq_a_der":
-            offset_x = (progreso * 0.70) * delta_x_max
-        elif direccion == "der_a_izq":
-            offset_x = (1.0 - (progreso * 0.70)) * delta_x_max
-        else:
-            offset_x = delta_x_max / 2.0
+        # Coordenadas en coma flotante (sub-pixel)
+        x0 = cx - (w_actual / 2.0)
+        y0 = cy - (h_actual / 2.0)
+        x1 = x0 + w_actual
+        y1 = y0 + h_actual
 
-        offset_y = (h_orig - h_curr) / 2.0
-
-        # Coordenadas enteras de corte directo
-        box = (
-            int(offset_x),
-            int(offset_y),
-            int(offset_x + w_curr),
-            int(offset_y + h_curr)
+        # Extracción y resize directo con transform EXTENT (interpolación continua en C)
+        # La tupla (x0, y0, x1, y1) con floats evita el redondeo brusco a enteros
+        frame_pil = img_orig.transform(
+            (ANCHO_OUT, ALTO_OUT),
+            Image.EXTENT,
+            (x0, y0, x1, y1),
+            Image.Resampling.BILINEAR
         )
 
-        # Recorte y rescale ultrarrápido nativo
-        frame = img_orig.crop(box).resize((ANCHO_OUT, ALTO_OUT), Image.Resampling.BILINEAR)
-        return np.array(frame)
+        return np.array(frame_pil)
 
     return VideoClip(make_frame, duration=duracion)
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-45fps-steady"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-pushin-subpixel-45fps"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -102,19 +108,18 @@ def generar_video():
     video_path = None
 
     try:
-        # Descarga rápida de fotos
         for url in urls[:3]:
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             tmp.close()
             descargar_imagen(url, tmp.name)
             archivos_temp.append(tmp.name)
 
-        # 3 tomas a 45 FPS (2.6s por toma = recorrido dinámico)
-        c1 = crear_clip_paneo_fluido(archivos_temp[0], duracion=2.6, direccion="izq_a_der")
-        c2 = crear_clip_paneo_fluido(archivos_temp[1], duracion=2.6, direccion="der_a_izq")
-        c3 = crear_clip_paneo_fluido(archivos_temp[2], duracion=2.6, direccion="izq_a_der")
+        # 3 tomas con empuje frontal progresivo continuo (2.7s cada una)
+        c1 = crear_clip_incursion_frontal(archivos_temp[0], duracion=2.7, zoom_ratio=0.16)
+        c2 = crear_clip_incursion_frontal(archivos_temp[1], duracion=2.7, zoom_ratio=0.20)
+        c3 = crear_clip_incursion_frontal(archivos_temp[2], duracion=2.7, zoom_ratio=0.16)
 
-        # Flashes blancos de corte limpio (0.10s a 45 FPS son 4 frames exactos de luz)
+        # Flashes blancos de transición (0.10s)
         f1 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.10)
         f2 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.10)
 
@@ -124,7 +129,7 @@ def generar_video():
         video_path = tmp_video.name
         tmp_video.close()
 
-        # Renderizado a 45 FPS forzando ultrafast y 1 thread para no ahogar la CPU compartida
+        # Renderizado a 45 FPS constante
         video_completo.write_videofile(
             video_path,
             fps=FPS,
