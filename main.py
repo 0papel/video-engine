@@ -22,10 +22,10 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# Formato Vertical Celular (9:16 compacto para máxima nitidez y bajo consumo de RAM)
-ANCHO = 360
-ALTO = 640
-FPS = 15
+# Geometría vertical y fluidez calibrada
+ANCHO_OUT = 540
+ALTO_OUT = 960
+FPS = 45  # 45 FPS continuos para máxima suavidad cinemática
 
 def descargar_imagen(url, ruta_salida):
     r = requests.get(url, stream=True, timeout=15)
@@ -34,63 +34,60 @@ def descargar_imagen(url, ruta_salida):
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
 
-def preparar_recorte_vertical(img_pil):
+def crear_clip_paneo_fluido(ruta_img, duracion=2.6, direccion="izq_a_der"):
     """
-    Toma la foto en alta resolución nativa y extrae el encuadre 9:16 central
-    SIN bajarle resolución previa para evitar pixelaciones.
+    Marco móvil vertical (9:16) sobre la foto panorámica de alta resolución.
+    Optimizado en C (Pillow BILINEAR) para sostener 45 FPS sin saturar la CPU de Render.
     """
-    w_orig, h_orig = img_pil.size
-    ratio_destino = ANCHO / ALTO  # 9/16 = 0.5625
-    ratio_orig = w_orig / h_orig
+    img_orig = Image.open(ruta_img).convert("RGB")
+    w_orig, h_orig = img_orig.size
 
-    if ratio_orig > ratio_destino:
-        # La foto es más ancha: recortamos los laterales al centro
-        nuevo_w = int(h_orig * ratio_destino)
-        offset_x = (w_orig - nuevo_w) // 2
-        crop_box = (offset_x, 0, offset_x + nuevo_w, h_orig)
-    else:
-        # La foto es más alta: recortamos arriba/abajo al centro
-        nuevo_h = int(w_orig / ratio_destino)
-        offset_y = (h_orig - nuevo_h) // 2
-        crop_box = (0, offset_y, w_orig, offset_y + nuevo_h)
+    # Definir marco base 9:16 abarcando el alto total disponible
+    h_marco = int(h_orig * 0.96)
+    w_marco = int(h_marco * (ANCHO_OUT / ALTO_OUT))
 
-    return img_pil.crop(crop_box)
+    # Ajuste de bordes si la foto es angosta
+    if w_marco > w_orig:
+        w_marco = w_orig
+        h_marco = int(w_marco * (ALTO_OUT / ANCHO_OUT))
 
-def crear_clip_vertical_inmersivo(ruta_img, duracion=2.8, zoom_max=0.20):
-    """
-    Genera un avance frontal (push-in) suave sobre la foto en alta resolución nativa,
-    escalando únicamente al frame final 360x640 para mantener máxima definición.
-    """
-    img_raw = Image.open(ruta_img).convert("RGB")
-    # Base 9:16 recortada en alta resolución
-    img_base = preparar_recorte_vertical(img_raw)
-    bw, bh = img_base.size
+    delta_x_max = w_orig - w_marco
 
     def make_frame(t):
         progreso = t / duracion
-        
-        # Factor de avance progresivo (zoom in frontal)
-        factor = 1.0 + (progreso * zoom_max)
-        
-        # Dimensiones de la ventana de captura en alta resolución
-        cw = int(bw / factor)
-        ch = int(bh / factor)
-        
-        # Centrado dinámico
-        left = (bw - cw) // 2
-        top = (bh - ch) // 2
-        
-        # Recorte de la ventana y resize final a 360x640 usando interpolación Lanczos limpia
-        frame_crop = img_base.crop((left, top, left + cw, top + ch))
-        frame_final = frame_crop.resize((ANCHO, ALTO), Image.Resampling.LANCZOS)
-        
-        return np.array(frame_final)
+
+        # Incursión Z progresiva (el marco se reduce un 8% hacia el fondo)
+        zoom = 1.0 - (progreso * 0.08)
+        w_curr = w_marco * zoom
+        h_curr = h_marco * zoom
+
+        # Paneo horizontal suave
+        if direccion == "izq_a_der":
+            offset_x = (progreso * 0.70) * delta_x_max
+        elif direccion == "der_a_izq":
+            offset_x = (1.0 - (progreso * 0.70)) * delta_x_max
+        else:
+            offset_x = delta_x_max / 2.0
+
+        offset_y = (h_orig - h_curr) / 2.0
+
+        # Coordenadas enteras de corte directo
+        box = (
+            int(offset_x),
+            int(offset_y),
+            int(offset_x + w_curr),
+            int(offset_y + h_curr)
+        )
+
+        # Recorte y rescale ultrarrápido nativo
+        frame = img_orig.crop(box).resize((ANCHO_OUT, ALTO_OUT), Image.Resampling.BILINEAR)
+        return np.array(frame)
 
     return VideoClip(make_frame, duration=duracion)
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-vertical-9-16"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-45fps-steady"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -105,39 +102,39 @@ def generar_video():
     video_path = None
 
     try:
-        # 1. Descarga temporal de las fotos
+        # Descarga rápida de fotos
         for url in urls[:3]:
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             tmp.close()
             descargar_imagen(url, tmp.name)
             archivos_temp.append(tmp.name)
 
-        # 2. Clips verticales con avance frontal puro
-        c1 = crear_clip_vertical_inmersivo(archivos_temp[0], duracion=2.8, zoom_max=0.18)
-        c2 = crear_clip_vertical_inmersivo(archivos_temp[1], duracion=2.8, zoom_max=0.22)
-        c3 = crear_clip_vertical_inmersivo(archivos_temp[2], duracion=2.8, zoom_max=0.18)
+        # 3 tomas a 45 FPS (2.6s por toma = recorrido dinámico)
+        c1 = crear_clip_paneo_fluido(archivos_temp[0], duracion=2.6, direccion="izq_a_der")
+        c2 = crear_clip_paneo_fluido(archivos_temp[1], duracion=2.6, direccion="der_a_izq")
+        c3 = crear_clip_paneo_fluido(archivos_temp[2], duracion=2.6, direccion="izq_a_der")
 
-        # 3. Flashes blancos verticales de transición (0.15s)
-        f1 = ColorClip(size=(ANCHO, ALTO), color=(255, 255, 255), duration=0.15)
-        f2 = ColorClip(size=(ANCHO, ALTO), color=(255, 255, 255), duration=0.15)
+        # Flashes blancos de corte limpio (0.10s a 45 FPS son 4 frames exactos de luz)
+        f1 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.10)
+        f2 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.10)
 
         video_completo = concatenate_videoclips([c1, f1, c2, f2, c3], method="compose")
 
-        # 4. Renderizado ultraliviano vertical
         tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         video_path = tmp_video.name
         tmp_video.close()
 
+        # Renderizado a 45 FPS forzando ultrafast y 1 thread para no ahogar la CPU compartida
         video_completo.write_videofile(
             video_path,
             fps=FPS,
             codec="libx264",
             audio=False,
             preset="ultrafast",
+            ffmpeg_params=["-tune", "zerolatency"],
             threads=1
         )
 
-        # 5. Subida a Cloudinary
         upload_result = cloudinary.uploader.upload(
             video_path,
             resource_type="video",
