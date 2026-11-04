@@ -23,10 +23,12 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# Widescreen 16:9 optimizado (liviano, estable y nítido)
 ANCHO_OUT = 640
 ALTO_OUT = 360
 FPS = 30
+
+GRID_COLS = 8
+GRID_ROWS = 8
 
 def descargar_imagen(url, ruta_salida):
     r = requests.get(url, stream=True, timeout=15)
@@ -39,7 +41,7 @@ def preparar_imagen_16_9(ruta_img):
     img = Image.open(ruta_img).convert("RGB")
     w, h = img.size
 
-    # Limitar resolución para blindar los 512 MB de RAM de Render
+    # Techo de resolución para blindar los 512 MB de Render
     if max(w, h) > 1600:
         escala = 1600.0 / max(w, h)
         img = img.resize((int(w * escala), int(h * escala)), Image.Resampling.BILINEAR)
@@ -59,48 +61,75 @@ def preparar_imagen_16_9(ruta_img):
 
     return img
 
-def crear_clip_incursion_focal(img_base, duracion=2.5, zoom_ratio=0.25, modo="crucero", sesgo_y=0.40):
+def crear_clip_mesh_inmersivo(img_base, duracion=2.5, zoom_ratio=0.25, modo="crucero", sesgo_y=0.40, curvatura_mesh=0.15):
     """
-    Control cinemático con punto de fuga corregido:
-    - sesgo_y: ajusta la altura del anclaje (0.40 evita que la cámara mire hacia el piso).
-    - modo 'acelerar': arranca suave y termina a fondo (Foto 1).
-    - modo 'crucero': velocidad continua alta constante sin frenar (Foto 2).
-    - modo 'desacelerar': entra rápido y frena suave al fondo (Foto 3).
+    Simula avance espacial mediante una malla 2.5D deformada (Pillow MESH):
+    - Los cuadriláteros del fondo avanzan a paso moderado.
+    - Los cuadriláteros exteriores (marcos, puertas, paredes) se aceleran hacia los bordes.
     """
     w_orig, h_orig = img_base.size
 
-    cx = w_orig / 2.0
-    cy = h_orig * sesgo_y  # Punto de fuga anclado al horizonte/fondo
+    # Puntos fijos de destino en pantalla (pantalla completa 640x360 dividida en celdas)
+    x_dest = np.linspace(0, ANCHO_OUT, GRID_COLS + 1)
+    y_dest = np.linspace(0, ALTO_OUT, GRID_ROWS + 1)
+
+    # Coordenadas normalizadas centradas en el punto de fuga focal
+    cx_norm = 0.5
+    cy_norm = sesgo_y
 
     def make_frame(t):
         p = max(0.0, min(1.0, t / duracion))
 
+        # Perfil cinemático de aceleración
         if modo == "acelerar":
-            # Cuadrática creciente: toma velocidad hacia el corte
             factor_mov = p * p
         elif modo == "crucero":
-            # Lineal sostenido: mantiene el empuje adquirido
             factor_mov = p
         elif modo == "desacelerar":
-            # Cuadrática decreciente: entra embalado y suaviza al final
             factor_mov = 1.0 - (1.0 - p) * (1.0 - p)
         else:
             factor_mov = p * p * (3.0 - 2.0 * p)
 
-        escala = 1.0 - (factor_mov * zoom_ratio)
-        w_actual = w_orig * escala
-        h_actual = h_orig * escala
+        # Factor de avance global
+        zoom_global = 1.0 - (factor_mov * zoom_ratio)
 
-        # Límites con sub-píxel continuo
-        x0 = cx - (w_actual / 2.0)
-        y0 = cy - (h_actual / 2.0)
-        x1 = x0 + w_actual
-        y1 = y0 + h_actual
+        # Construcción de la malla deformada para Image.MESH
+        mesh_data = []
+
+        for j in range(GRID_ROWS):
+            for i in range(GRID_COLS):
+                # 1. Caja de salida en el frame final
+                dx0, dx1 = x_dest[i], x_dest[i + 1]
+                dy0, dy1 = y_dest[j], y_dest[j + 1]
+                target_box = (int(dx0), int(dy0), int(dx1), int(dy1))
+
+                # 2. Vértices normalizados de las cuatro esquinas (0 a 1)
+                u_pts = [dx0 / ANCHO_OUT, dx1 / ANCHO_OUT, dx1 / ANCHO_OUT, dx0 / ANCHO_OUT]
+                v_pts = [dy0 / ALTO_OUT, dy0 / ALTO_OUT, dy1 / ALTO_OUT, dy1 / ALTO_OUT]
+
+                src_quad = []
+                for u, v in zip(u_pts, v_pts):
+                    # Distancia de cada vértice al punto focal
+                    du = (u - cx_norm)
+                    dv = (v - cy_norm)
+                    dist = np.sqrt(du * du + dv * dv)
+
+                    # Deformación 2.5D: la periferia se expande más rápido que el centro
+                    fuga_periferica = 1.0 + (curvatura_mesh * factor_mov * (dist ** 1.8))
+                    factor_total = zoom_global / fuga_periferica
+
+                    # Mapeo a píxeles de la imagen original
+                    sx = (cx_norm + du * factor_total) * w_orig
+                    sy = (cy_norm + dv * factor_total) * h_orig
+                    src_quad.extend([sx, sy])
+
+                # MESH requiere tupla: (caja_destino, 8_coordenadas_origen)
+                mesh_data.append((target_box, tuple(src_quad)))
 
         frame_pil = img_base.transform(
             (ANCHO_OUT, ALTO_OUT),
-            Image.EXTENT,
-            (x0, y0, x1, y1),
+            Image.MESH,
+            mesh_data,
             Image.Resampling.BILINEAR
         )
 
@@ -110,7 +139,7 @@ def crear_clip_incursion_focal(img_base, duracion=2.5, zoom_ratio=0.25, modo="cr
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-horizon-fixed"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-mesh-2.5d"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -135,16 +164,37 @@ def generar_video():
         for ruta in archivos_temp:
             imagenes_pil.append(preparar_imagen_16_9(ruta))
 
-        # 1. Portada/Fachada: Incursión que acelera hacia el acceso (sesgo Y 45%)
-        c1 = crear_clip_incursion_focal(imagenes_pil[0], duracion=2.4, zoom_ratio=0.30, modo="acelerar", sesgo_y=0.45)
+        # 1. Portada: Acelera con expansión de bordes hacia la puerta
+        c1 = crear_clip_mesh_inmersivo(
+            imagenes_pil[0],
+            duracion=2.4,
+            zoom_ratio=0.30,
+            modo="acelerar",
+            sesgo_y=0.45,
+            curvatura_mesh=0.18
+        )
 
-        # 2. Hall/Pasillo: Mantiene la velocidad de avance continua sin mirar al piso (sesgo Y 38%)
-        c2 = crear_clip_incursion_focal(imagenes_pil[1], duracion=2.4, zoom_ratio=0.28, modo="crucero", sesgo_y=0.38)
+        # 2. Hall: Velocidad crucero continua, fuga de marcos laterales y horizonte corregido
+        c2 = crear_clip_mesh_inmersivo(
+            imagenes_pil[1],
+            duracion=2.4,
+            zoom_ratio=0.28,
+            modo="crucero",
+            sesgo_y=0.38,
+            curvatura_mesh=0.22
+        )
 
-        # 3. Quincho/Piscina: Entra con la inercia y desacelera suave en el patio (sesgo Y 44%)
-        c3 = crear_clip_incursion_focal(imagenes_pil[2], duracion=2.6, zoom_ratio=0.22, modo="desacelerar", sesgo_y=0.44)
+        # 3. Terraza/Quincho: Desacelera suave hacia el fondo del patio
+        c3 = crear_clip_mesh_inmersivo(
+            imagenes_pil[2],
+            duracion=2.6,
+            zoom_ratio=0.22,
+            modo="desacelerar",
+            sesgo_y=0.44,
+            curvatura_mesh=0.16
+        )
 
-        # Destellos casi imperceptibles de 0.04s (1 fotograma a 30 FPS)
+        # Destellos rápidos (1 frame a 30 FPS)
         f1 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
         f2 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
 
@@ -154,7 +204,6 @@ def generar_video():
         video_path = tmp_video.name
         tmp_video.close()
 
-        # Renderizado liviano con buffer acotado
         video_completo.write_videofile(
             video_path,
             fps=FPS,
