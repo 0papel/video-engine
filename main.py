@@ -2,6 +2,12 @@ import os
 import requests
 import tempfile
 from flask import Flask, request, jsonify
+
+# Parche de compatibilidad: Pillow 10+ eliminó ANTIALIAS, MoviePy 1.0.3 lo exige
+import PIL.Image
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
+
 from moviepy.editor import ImageClip, ColorClip, concatenate_videoclips
 import cloudinary
 import cloudinary.uploader
