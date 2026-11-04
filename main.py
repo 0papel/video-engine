@@ -23,7 +23,7 @@ cloudinary.config(
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", "")
 )
 
-# 16:9 widescreen estándar optimizado (liviano, estable y sin costuras)
+# Widescreen 16:9 optimizado (liviano, estable y sin costuras)
 ANCHO_OUT = 640
 ALTO_OUT = 360
 FPS = 30
@@ -59,37 +59,34 @@ def preparar_imagen_16_9(ruta_img):
 
     return img
 
-def crear_clip_flujo_relativista(img_base, duracion=2.4, modo="crucero", sesgo_y=0.40, v_centro=0.18, v_periferia=0.32):
+def crear_clip_flujo_relativista(img_base, duracion=2.4, modo="crucero", sesgo_y=0.40, v_centro=0.20, v_periferia=0.18):
     """
-    Simulación de avance continuo con gradiente de velocidad radial:
-    - Centro: avance suave hacia el fondo.
-    - Laterales: velocidad diferencial no lineal hacia afuera (sensación de paso de paredes).
-    - Cero cortes, paño 100% continuo.
+    Simulación de avance continuo con gradiente radial calibrado:
+    - v_periferia moderado (mitad de distorsión para conservar líneas naturales).
+    - v_centro agresivo en portada para clavar la cámara en el acceso.
     """
     img_arr = np.array(img_base, dtype=np.uint8)
     h_orig, w_orig, _ = img_arr.shape
 
-    # Grilla de coordenadas normalizadas en el canvas de salida
+    # Grilla de coordenadas normalizadas
     y_idx, x_idx = np.indices((ALTO_OUT, ANCHO_OUT), dtype=np.float32)
 
     cx_out = ANCHO_OUT / 2.0
     cy_out = ALTO_OUT * sesgo_y
 
-    # Vector distancia radial normalizada desde el punto de fuga (0 en centro, ~1 en bordes)
     dx_norm = (x_idx - cx_out) / (ANCHO_OUT / 2.0)
     dy_norm = (y_idx - cy_out) / (ALTO_OUT / 2.0)
     radio = np.sqrt(dx_norm**2 + dy_norm**2)
-    # Exponente de curvatura: el centro se mantiene plano y la periferia se dispara
-    periferia_curva = np.power(radio, 1.6)
+    
+    # Periferia suavizada (potencia cuadrática para que solo afecte bordes extremos)
+    periferia_curva = np.power(radio, 1.8)
 
-    # Centro focal en la imagen original
     cx_src = w_orig / 2.0
     cy_src = h_orig * sesgo_y
 
     def make_frame(t):
         p = max(0.0, min(1.0, t / duracion))
 
-        # Perfil cinemático
         if modo == "acelerar":
             f = p * p
         elif modo == "crucero":
@@ -99,28 +96,22 @@ def crear_clip_flujo_relativista(img_base, duracion=2.4, modo="crucero", sesgo_y
         else:
             f = p * p * (3.0 - 2.0 * p)
 
-        # Factor de expansión no lineal:
-        # El centro escala con v_centro, los laterales se aceleran con v_periferia
+        # Factor de escala calibrado
         factor_escala = 1.0 + f * (v_centro + (v_periferia * periferia_curva))
 
-        # Mapeo inverso de coordenadas hacia la imagen original
-        # A mayor factor_escala en pantalla, la coordenada de origen se contrae hacia el centro
         src_x = cx_src + ((x_idx - cx_out) * (w_orig / ANCHO_OUT)) / factor_escala
         src_y = cy_src + ((y_idx - cy_out) * (h_orig / ALTO_OUT)) / factor_escala
 
-        # Clamping dentro de los límites de la matriz
         src_x = np.clip(src_x, 0, w_orig - 1).astype(np.int32)
         src_y = np.clip(src_y, 0, h_orig - 1).astype(np.int32)
 
-        # Reconstrucción instantánea por indexación NumPy
-        frame = img_arr[src_y, src_x]
-        return frame
+        return img_arr[src_y, src_x]
 
     return VideoClip(make_frame, duration=duracion)
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-radial-flow"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-calibrated-flow"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -145,37 +136,37 @@ def generar_video():
         for ruta in archivos_temp:
             imagenes_pil.append(preparar_imagen_16_9(ruta))
 
-        # 1. Portada: Empuje acelerado hacia la puerta
+        # 1. Portada (3.2s): Pista larga, zoom veloz contra el acceso (v_centro=0.36)
         c1 = crear_clip_flujo_relativista(
             imagenes_pil[0],
-            duracion=2.4,
+            duracion=3.2,
             modo="acelerar",
             sesgo_y=0.45,
-            v_centro=0.22,
-            v_periferia=0.35
+            v_centro=0.36,
+            v_periferia=0.18
         )
 
-        # 2. Hall: Velocidad crucero continua, paredes laterales pasando rápido
+        # 2. Hall (1.8s): Crucero rápido sin respiro, paredes envolventes suaves
         c2 = crear_clip_flujo_relativista(
             imagenes_pil[1],
-            duracion=2.4,
+            duracion=1.8,
             modo="crucero",
             sesgo_y=0.38,
-            v_centro=0.20,
-            v_periferia=0.38
+            v_centro=0.22,
+            v_periferia=0.16
         )
 
-        # 3. Quincho: Freno suave en el patio
+        # 3. Quincho (2.0s): Desaceleración suave para aterrizar en la piscina
         c3 = crear_clip_flujo_relativista(
             imagenes_pil[2],
-            duracion=2.6,
+            duracion=2.0,
             modo="desacelerar",
             sesgo_y=0.44,
-            v_centro=0.15,
-            v_periferia=0.28
+            v_centro=0.16,
+            v_periferia=0.14
         )
 
-        # Destellos secos de 1 frame (0.04s)
+        # Micro-destellos de 1 frame (0.04s)
         f1 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
         f2 = ColorClip(size=(ANCHO_OUT, ALTO_OUT), color=(255, 255, 255), duration=0.04)
 
