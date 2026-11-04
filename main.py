@@ -1,14 +1,16 @@
 import os
 import requests
 import tempfile
+import cv2
+import numpy as np
 from flask import Flask, request, jsonify
 
-# Compatibilidad Pillow 10+ con MoviePy 1.0.3
+# Compatibilidad Pillow / MoviePy
 import PIL.Image
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
 
-from moviepy.editor import ImageClip, ColorClip, concatenate_videoclips
+from moviepy.editor import VideoClip, ColorClip, concatenate_videoclips
 import cloudinary
 import cloudinary.uploader
 
@@ -32,23 +34,61 @@ def descargar_imagen(url, ruta_salida):
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
 
-def crear_clip(ruta_img, duracion=2.5, zoom=1.12):
-    # Imagen base ajustada a 720p
-    clip = (ImageClip(ruta_img)
-            .resize((ANCHO, ALTO))
-            .set_duration(duracion))
+def crear_clip_perspectiva_3d(ruta_img, duracion=3.0, intensidad_profundidad=0.08):
+    """
+    Simula una cámara entrando en un túnel 3D:
+    - Paneo que inicia levemente escorado a la izquierda.
+    - Avance hacia el centro.
+    - Deformación trapezoidal homográfica en las paredes laterales con OpenCV.
+    """
+    # Leer en formato BGR y convertir a RGB
+    img = cv2.imread(ruta_img)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # Zoom lineal liviano
-    def efecto_zoom(get_frame, t):
-        factor = 1.0 + (zoom - 1.0) * (t / duracion)
-        return clip.resize(factor).get_frame(t)
+    # Ajuste base proporcional a 720p
+    img = cv2.resize(img, (ANCHO, ALTO), interpolation=cv2.INTER_AREA)
+    h, w, _ = img.shape
 
-    clip_zoom = clip.fl(efecto_zoom)
-    return clip_zoom.crop(x_center=clip_zoom.w / 2, y_center=clip_zoom.h / 2, width=ANCHO, height=ALTO)
+    # Puntos destino estándar (pantalla completa 1280x720)
+    pts_dst = np.float32([
+        [0, 0],
+        [ANCHO, 0],
+        [ANCHO, ALTO],
+        [0, ALTO]
+    ])
+
+    def make_frame(t):
+        progreso = t / duracion
+        
+        # 1. Paneo de izquierda hacia el centro
+        offset_x = (1.0 - progreso) * (ANCHO * 0.05)
+        
+        # 2. Zoom de avance
+        zoom_margin_x = progreso * (ANCHO * 0.08)
+        zoom_margin_y = progreso * (ALTO * 0.08)
+        
+        # 3. Profundidad 3D: levantamiento trapezoidal en bordes
+        # Los laterales se abren verticalmente para crear la fuga de paredes
+        fuga = (progreso * intensidad_profundidad) * ALTO
+        
+        # Puntos de origen deformados para la homografía
+        pts_src = np.float32([
+            [zoom_margin_x - offset_x, zoom_margin_y - fuga],               # Superior Izquierda
+            [w - zoom_margin_x - offset_x, zoom_margin_y + (fuga * 0.5)],  # Superior Derecha
+            [w - zoom_margin_x - offset_x, h - zoom_margin_y - (fuga * 0.5)],# Inferior Derecha
+            [zoom_margin_x - offset_x, h - zoom_margin_y + fuga]           # Inferior Izquierda
+        ])
+
+        # Matriz de perspectiva 3x3 y deformación acelerada
+        matriz = cv2.getPerspectiveTransform(pts_src, pts_dst)
+        frame_warped = cv2.warpPerspective(img, matriz, (ANCHO, ALTO), borderMode=cv2.BORDER_REPLICATE)
+        return frame_warped
+
+    return VideoClip(make_frame, duration=duracion)
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "motor": "video-engine-16-9"}), 200
+    return jsonify({"status": "ok", "motor": "video-engine-opencv-3d"}), 200
 
 @app.route("/generar", methods=["POST"])
 def generar_video():
@@ -63,25 +103,25 @@ def generar_video():
     video_path = None
 
     try:
-        # 1. Descarga temporal
+        # 1. Descarga temporal de las fotos reales
         for url in urls[:3]:
-            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             tmp.close()
             descargar_imagen(url, tmp.name)
             archivos_temp.append(tmp.name)
 
-        # 2. Clips rápidos (2.5s cada uno para no sobrecargar el render)
-        c1 = crear_clip(archivos_temp[0], duracion=2.5, zoom=1.12)
-        c2 = crear_clip(archivos_temp[1], duracion=2.5, zoom=1.10)
-        c3 = crear_clip(archivos_temp[2], duracion=2.5, zoom=1.08)
+        # 2. Clips con perspectiva y fuga 3D
+        c1 = crear_clip_perspectiva_3d(archivos_temp[0], duracion=3.0, intensidad_profundidad=0.07)
+        c2 = crear_clip_perspectiva_3d(archivos_temp[1], duracion=3.0, intensidad_profundidad=0.09)
+        c3 = crear_clip_perspectiva_3d(archivos_temp[2], duracion=3.0, intensidad_profundidad=0.06)
 
-        # 3. Flashazos blancos de 0.2s
+        # 3. Flashes blancos limpios de transición (0.2s)
         f1 = ColorClip(size=(ANCHO, ALTO), color=(255, 255, 255), duration=0.2)
         f2 = ColorClip(size=(ANCHO, ALTO), color=(255, 255, 255), duration=0.2)
 
         video_completo = concatenate_videoclips([c1, f1, c2, f2, c3], method="compose")
 
-        # 4. Salida MP4 ligera (menos cuadros y preset ultrafast)
+        # 4. Renderizado ultraliviano
         tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         video_path = tmp_video.name
         tmp_video.close()
@@ -95,7 +135,7 @@ def generar_video():
             threads=1
         )
 
-        # 5. Subida a Cloudinary
+        # 5. Subida a Cloudinary con el ID de la propiedad real
         upload_result = cloudinary.uploader.upload(
             video_path,
             resource_type="video",
